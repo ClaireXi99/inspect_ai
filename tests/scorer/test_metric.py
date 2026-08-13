@@ -1,3 +1,4 @@
+import math
 from typing import Any, Callable, cast
 
 import pytest
@@ -5,6 +6,7 @@ from pydantic import BaseModel
 
 from inspect_ai import Task, eval, score
 from inspect_ai._util.constants import PKG_NAME
+from inspect_ai._util.json import to_json_str_safe
 from inspect_ai._util.registry import registry_info
 from inspect_ai.dataset import Sample
 from inspect_ai.scorer import (
@@ -25,7 +27,9 @@ from inspect_ai.scorer._metric import (
     MetricDeprecated,
     MetricProtocol,
     SampleScore,
+    ScoreEdit,
     metric_create,
+    value_to_float,
 )
 from inspect_ai.scorer._metrics import grouped
 from inspect_ai.scorer._metrics.std import stderr
@@ -116,6 +120,25 @@ def test_metric_create() -> None:
     metric_create_assert("accuracy4", correct="C")
 
 
+@metric
+def kwargs_metric(**kwargs: Any) -> Metric:
+    def metric(scores: list[SampleScore]) -> int | float:
+        return 1
+
+    return metric
+
+
+def test_metric_create_replays_name_kwarg_without_collision() -> None:
+    """A `**kwargs` key named `name` must survive metric replay from a log (#4375).
+
+    Flat capture records such a key at the top level of the log's metric
+    options, so replaying it must not collide with metric_create's own
+    `name` parameter.
+    """
+    metric = metric_create("kwargs_metric", name="demo")
+    assert metric([]) == 1
+
+
 def test_inspect_metrics() -> None:
     registry_assert(accuracy, f"{PKG_NAME}/accuracy")
     registry_assert(accuracy(), f"{PKG_NAME}/accuracy")
@@ -153,6 +176,40 @@ def test_list_metric() -> None:
     # normal eval
     log = eval(tasks=task, model="mockllm/model")[0]
     check_log(log)
+
+
+@pytest.mark.parametrize(
+    "value,leaf",
+    [
+        (float("nan"), lambda v: v),
+        (float("inf"), lambda v: v),
+        ([float("nan"), 1.0], lambda v: v[0]),
+        ({"a": float("nan"), "b": 1.0}, lambda v: v["a"]),
+        ({"a": float("-inf"), "b": 1.0}, lambda v: v["a"]),
+    ],
+)
+def test_score_non_finite_value_round_trip(value: Value, leaf: Any) -> None:
+    """Non-finite score values survive JSON serialization in every shape.
+
+    Serialized as JSON constants (NaN/Infinity) rather than null, via both
+    model_dump_json and the to_json_safe log write path.
+    """
+    score = Score(value=value)
+    for wire in (score.model_dump_json(exclude_none=True), to_json_str_safe(score)):
+        assert "null" not in wire
+        restored = Score.model_validate_json(wire)
+        original, roundtripped = leaf(score.value), leaf(restored.value)
+        if math.isnan(original):
+            assert math.isnan(roundtripped)
+        else:
+            assert roundtripped == original
+
+
+def test_score_edit_non_finite_value_round_trip() -> None:
+    edit = ScoreEdit(value=[float("nan"), 1.0])
+    restored = ScoreEdit.model_validate_json(edit.model_dump_json())
+    assert isinstance(restored.value, list)
+    assert math.isnan(cast(float, restored.value[0]))
 
 
 def test_dict_metric() -> None:
@@ -284,6 +341,12 @@ def metric_create_assert(name: str, **kwargs: Any) -> None:
     assert metric([]) == 1
 
 
+def test_accuracy_handles_empty_scores() -> None:
+    # An empty score list must not raise; mirror the std()/var() convention of
+    # returning 0 for insufficient data instead of a ZeroDivisionError.
+    assert accuracy()([]) == 0.0
+
+
 @metric
 def nested_dict_metric(correct: str = "C") -> Metric:
     def metric(scores: list[SampleScore]) -> Value:
@@ -309,10 +372,9 @@ def test_nested_dict_metrics() -> None:
         assert len(log.results.scores) == 4
         assert log.results.scores[1].name == "one"
         assert len(log.results.scores[1].metrics.values()) == 2
-        assert (
-            log.results.scores[1].metrics["nested_dict_metric_key1"].name
-            == "nested_dict_metric_key1"
-        )
+        m = log.results.scores[1].metrics["nested_dict_metric_key1"]
+        assert m.name == "key1"
+        assert m.group == "nested_dict_metric"
 
     task = Task(
         dataset=[Sample(input="What is 1 + 1?", target=["2", "2.0", "Two"])],
@@ -349,10 +411,9 @@ def test_nested_list_metrics() -> None:
         assert len(log.results.scores) == 4
         assert log.results.scores[1].name == "one"
         assert len(log.results.scores[1].metrics.values()) == 2
-        assert (
-            log.results.scores[1].metrics["nested_list_metric_0"].name
-            == "nested_list_metric_0"
-        )
+        m = log.results.scores[1].metrics["nested_list_metric_0"]
+        assert m.name == "0"
+        assert m.group == "nested_list_metric"
 
     task = Task(
         dataset=[Sample(input="What is 1 + 1?", target=["2", "2.0", "Two"])],
@@ -375,6 +436,43 @@ def test_stderr():
     metric = stderr()
     se = metric([SampleScore(score=Score(value=i)) for i in range(10)])
     assert round(se, 3) == 0.957
+
+
+def test_mean_numeric():
+    metric = mean()
+    result = metric([SampleScore(score=Score(value=i)) for i in range(10)])
+    assert result == 4.5
+
+
+def test_mean_label_vocabulary():
+    # Regression: mean() previously used Score.as_float(), which calls
+    # float("C") and raises ValueError on the framework's own CORRECT /
+    # INCORRECT / PARTIAL / NOANSWER labels -- even though accuracy() (and
+    # std/var/stderr) map them via value_to_float(). A scorer emitting these
+    # labels with [accuracy(), mean()] attached would crash at metric time.
+    # mean() now shares the same value-to-float vocabulary as its siblings.
+    metric = mean()
+    result = metric(
+        [
+            SampleScore(score=Score(value="C")),
+            SampleScore(score=Score(value="I")),
+            SampleScore(score=Score(value="P")),
+            SampleScore(score=Score(value="N")),
+        ]
+    )
+    # C=1.0, I=0, P=0.5, N=0 -> mean 0.375
+    assert result == 0.375
+
+
+def test_mean_custom_to_float():
+    metric = mean(to_float=value_to_float(correct="win"))
+    result = metric(
+        [
+            SampleScore(score=Score(value="win")),
+            SampleScore(score=Score(value="win")),
+        ]
+    )
+    assert result == 1.0
 
 
 def test_clustered_stderr():
@@ -670,3 +768,38 @@ def test_dict_metric_all_samples_unscored():
         assert r.scored_samples == 0
         assert r.unscored_samples == 3
         assert math.isnan(r.metrics["mean"].value)
+
+
+def test_metrics_return_zero_for_empty_scores() -> None:
+    # Every built-in numeric metric must handle an empty score list by
+    # returning 0.0 rather than nan (with numpy empty-slice warnings). See the
+    # empty-input guards documented in accuracy()/std()/var().
+    from inspect_ai.scorer import (
+        accuracy,
+        bootstrap_stderr,
+        mean,
+        std,
+        stderr,
+        var,
+    )
+
+    for metric_fn in (
+        accuracy(),
+        mean(),
+        var(),
+        std(),
+        stderr(),
+        stderr(cluster="cluster_id"),
+        bootstrap_stderr(),
+    ):
+        assert metric_fn([]) == 0.0
+
+
+def test_grouped_metric_empty_scores() -> None:
+    # grouped() metric with all="groups" or all="samples" must return 0.0
+    # aggregate for empty scores without numpy empty-slice warnings.
+    metric_samples = grouped(mean(), group_key="group", all="samples")
+    assert metric_samples([]) == {"all": 0.0}
+
+    metric_groups = grouped(mean(), group_key="group", all="groups")
+    assert metric_groups([]) == {"all": 0.0}

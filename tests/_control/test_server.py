@@ -28,10 +28,16 @@ def test_wait_for_shutdown_cancel_leaves_no_blocked_thread() -> None:
     and forcing a second Ctrl+C. The wait now awaits a loop-native event,
     so cancellation leaves no thread behind.
     """
-    from inspect_ai._control.server import ControlServer, wait_for_shutdown_async
+    from inspect_ai._control.server import (
+        ControlServer,
+        request_keep_alive,
+        reset_keep_alive,
+        wait_for_shutdown_async,
+    )
 
     async def scenario() -> int:
         server = ControlServer(run_id="test")
+        request_keep_alive()  # so the park actually blocks
         before = _worker_threads()
         task = asyncio.ensure_future(wait_for_shutdown_async(server))
         try:
@@ -42,31 +48,95 @@ def test_wait_for_shutdown_cancel_leaves_no_blocked_thread() -> None:
             await asyncio.sleep(0.1)  # give any spawned worker time to appear
             return _worker_threads() - before
         finally:
-            # Release any abandoned worker so a reintroduced regression
-            # fails the assertion instead of hanging the suite at exit.
-            server.shutdown_event.set()
+            reset_keep_alive()
 
     leaked = asyncio.run(scenario())
     assert leaked == 0, f"cancelled shutdown wait leaked {leaked} worker thread(s)"
 
 
-def test_wait_for_shutdown_returns_when_event_set() -> None:
-    """Setting the shutdown event releases the wait promptly."""
-    from inspect_ai._control.server import ControlServer, wait_for_shutdown_async
+def test_stop_reraises_cancellation_without_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A Ctrl-C teardown must not log "did not shut down cleanly".
+
+    Regression: on Ctrl-C the eval's cancel scope tears down both the uvicorn
+    serve task and the ``stop()`` drain together, so ``asyncio.wait_for`` raises
+    ``CancelledError``. The drain used to catch that alongside ``Exception`` and
+    log a misleading ``Control server did not shut down cleanly`` warning (and
+    swallow the cancellation). ``stop()`` must instead re-raise the
+    cancellation, log nothing, and still run its discovery/socket cleanup.
+    """
+    import logging
+
+    from inspect_ai._control.server import ControlServer
+
+    class _StubUvicorn:
+        def __init__(self) -> None:
+            self.should_exit = False
+
+    async def scenario() -> bool:
+        server = ControlServer(run_id="test")
+        server._uvicorn_server = _StubUvicorn()
+        # A stand-in for uvicorn's serve task that never drains on its own, so
+        # the only way out of the drain's wait_for is the outer cancellation.
+        serve_task: asyncio.Task[None] = asyncio.ensure_future(asyncio.sleep(3600))
+        server._serve_task = serve_task
+
+        cleaned_up = False
+
+        async def _stop_and_track() -> None:
+            nonlocal cleaned_up
+            try:
+                await server.stop()
+            finally:
+                # stop()'s own finally must have run its cleanup before the
+                # cancellation propagates out of it.
+                cleaned_up = serve_task.cancelled() or serve_task.done()
+
+        stop_task = asyncio.ensure_future(_stop_and_track())
+        await asyncio.sleep(0.1)  # let stop() reach its wait_for
+        stop_task.cancel()  # simulate the eval cancel scope tearing down
+        with contextlib.suppress(asyncio.CancelledError):
+            await stop_task
+        # the cancellation must have propagated (stop did not swallow it)...
+        assert stop_task.cancelled()
+        return cleaned_up
+
+    with caplog.at_level(logging.WARNING, logger="inspect_ai._control.server"):
+        cleaned_up = asyncio.run(scenario())
+
+    assert cleaned_up, "stop() must still tear down the serve task on cancellation"
+    assert "did not shut down cleanly" not in caplog.text
+
+
+def test_wait_for_shutdown_returns_when_released() -> None:
+    """Releasing keep-alive (POST /release) wakes the park promptly."""
+    from inspect_ai._control.server import (
+        ControlServer,
+        request_keep_alive,
+        request_release,
+        reset_keep_alive,
+        wait_for_shutdown_async,
+    )
 
     async def scenario() -> None:
         server = ControlServer(run_id="test")
+        request_keep_alive()
 
-        async def _set_soon() -> None:
+        async def _release_soon() -> None:
             await asyncio.sleep(0.05)
-            server.shutdown_event.set()
+            request_release()
+            await server.notify_park_change()
 
         # asyncio.wait_for (not asyncio.timeout, which is 3.11+) keeps this
         # runnable + type-checkable on Python 3.10.
-        await asyncio.wait_for(
-            asyncio.gather(_set_soon(), wait_for_shutdown_async(server)),
-            timeout=5,
-        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(_release_soon(), wait_for_shutdown_async(server)),
+                timeout=5,
+            )
+        finally:
+            reset_keep_alive()
 
     asyncio.run(scenario())
 
@@ -81,10 +151,10 @@ def test_endpoint_error_becomes_structured_500(monkeypatch: pytest.MonkeyPatch) 
     """
     from inspect_ai._control import server as server_mod
 
-    async def _boom(eval_id: str, active_since: float | None = None) -> list:
+    async def _boom(*args: object, **kwargs: object) -> list:
         raise RuntimeError("kaboom")
 
-    monkeypatch.setattr(server_mod, "current_sample_summaries", _boom)
+    monkeypatch.setattr(server_mod, "current_sample_listing", _boom)
 
     async def scenario() -> httpx.Response:
         app = server_mod.ControlServer(run_id="test")._build_app()
@@ -171,6 +241,129 @@ def test_start_does_not_publish_discovery_when_bind_fails(
         assert list_discovered_servers() == []
 
     asyncio.run(run())
+
+
+def _listing_rows(n_completed: int, n_running: int = 0) -> list[dict]:
+    """Fixed sample rows in the listing's sort order (running first)."""
+    rows = [
+        {"sample_id": f"r{i}", "epoch": 1, "status": "running", "last_activity_at": 5.0}
+        for i in range(n_running)
+    ]
+    rows.extend(
+        {
+            "sample_id": f"c{i}",
+            "epoch": 1,
+            "status": "completed",
+            "last_activity_at": 5.0,
+        }
+        for i in range(n_completed)
+    )
+    return rows
+
+
+async def test_samples_endpoint_caps_and_histograms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`GET /evals/<id>/samples` caps rows by default and stays aggregate-complete.
+
+    The unseeded read on a large eval must not dump every row (the design
+    doc's constraint 2 — a full dump eats LLM-agent context): rows are capped
+    at the default limit, the `counts` histogram still covers the whole eval,
+    and `truncated` reports the cap structurally (no silent truncation).
+    `all=true` / `limit=N` adjust the cap; `status` filters rows without
+    shrinking `counts`.
+    """
+    from inspect_ai._control import server as server_mod
+    from inspect_ai._control import state as state_mod
+    from inspect_ai._control.state import DEFAULT_SAMPLE_LIST_LIMIT
+
+    async def _many(eval_id: str, active_since: float | None = None) -> list[dict]:
+        return _listing_rows(n_completed=DEFAULT_SAMPLE_LIST_LIMIT + 50, n_running=3)
+
+    # Patch the state layer's full listing (the endpoint's real cap /
+    # histogram logic in current_sample_listing still runs).
+    monkeypatch.setattr(state_mod, "current_sample_summaries", _many)
+
+    app = server_mod.ControlServer(run_id="test")._build_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://localhost"
+    ) as client:
+        # default: capped, histogram complete, truncation flagged
+        page = (await client.get("/evals/e1/samples")).json()
+        assert len(page["samples"]) == DEFAULT_SAMPLE_LIST_LIMIT
+        assert page["truncated"] is True
+        assert page["counts"]["running"] == 3
+        assert page["counts"]["completed"] == DEFAULT_SAMPLE_LIST_LIMIT + 50
+        assert page["counts"]["error"] == 0  # stable keys, zero when empty
+        # running rows sort first, so the cap keeps them
+        assert [s["status"] for s in page["samples"][:3]] == ["running"] * 3
+
+        # all=true: the explicit full dump
+        page = (await client.get("/evals/e1/samples", params={"all": True})).json()
+        assert len(page["samples"]) == DEFAULT_SAMPLE_LIST_LIMIT + 53
+        assert page["truncated"] is False
+
+        # limit=N: a custom cap
+        page = (await client.get("/evals/e1/samples", params={"limit": 5})).json()
+        assert len(page["samples"]) == 5
+        assert page["truncated"] is True
+
+        # status filter: rows narrow, counts stay whole-eval
+        page = (
+            await client.get("/evals/e1/samples", params={"status": "running"})
+        ).json()
+        assert [s["status"] for s in page["samples"]] == ["running"] * 3
+        assert page["truncated"] is False
+        assert page["counts"]["completed"] == DEFAULT_SAMPLE_LIST_LIMIT + 50
+
+        # active_since (the recency delta) rides the same envelope: rows
+        # empty (nothing active since then), counts still whole-eval
+        page = (
+            await client.get("/evals/e1/samples", params={"active_since": 10.0})
+        ).json()
+        assert page["samples"] == []
+        assert page["truncated"] is False
+        assert page["counts"]["completed"] == DEFAULT_SAMPLE_LIST_LIMIT + 50
+
+
+async def test_samples_endpoint_rejects_bad_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bad `limit` / `status` / `all` combinations 400 with a structured error."""
+    from inspect_ai._control import server as server_mod
+    from inspect_ai._control import state as state_mod
+
+    async def _none(eval_id: str, active_since: float | None = None) -> list[dict]:
+        return []
+
+    monkeypatch.setattr(state_mod, "current_sample_summaries", _none)
+
+    app = server_mod.ControlServer(run_id="test")._build_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://localhost"
+    ) as client:
+        below_one = await client.get("/evals/e1/samples", params={"limit": 0})
+        assert below_one.status_code == 400
+        assert "limit" in below_one.json()["error"]
+
+        contradictory = await client.get(
+            "/evals/e1/samples", params={"limit": 5, "all": True}
+        )
+        assert contradictory.status_code == 400
+        assert "mutually exclusive" in contradictory.json()["error"]
+
+        unknown = await client.get("/evals/e1/samples", params={"status": "bogus"})
+        assert unknown.status_code == 400
+        assert "bogus" in unknown.json()["error"]
+        assert "pending" in unknown.json()["error"]  # names the valid vocabulary
+
+        # an empty member set would silently drop every row — 400 instead
+        for empty in ("", ","):
+            response = await client.get("/evals/e1/samples", params={"status": empty})
+            assert response.status_code == 400, empty
+            assert "at least one status" in response.json()["error"]
 
 
 async def test_sample_endpoint_addresses_reserved_char_ids(
@@ -306,10 +499,12 @@ async def test_sample_events_endpoint_parses_type_and_404(
         full: object,
         since_time: object,
         until: object,
+        limit: object,
     ) -> dict[str, object] | None:
         seen["sample_id"] = sample_id
         seen["types"] = types
         seen["full"] = full
+        seen["limit"] = limit
         if sample_id == "missing":
             return None
         return {"events": [], "next": "c", "done": True}
@@ -339,21 +534,171 @@ async def test_sample_events_endpoint_parses_type_and_404(
         assert spaced.status_code == 200, spaced.text
         assert seen["types"] == frozenset({"model", "tool"})
 
+        # `limit` (page size) rides down; omitted → the server default.
+        # pop rather than index: mypy narrows `seen["limit"]` to the first
+        # compared literal (it can't see the handler mutating `seen`), which
+        # would flag the second comparison as non-overlapping.
+        assert seen.pop("limit") == 500
+        limited = await client.get(
+            "/evals/e1/sample/events", params={"sample_id": "case/001", "limit": 15}
+        )
+        assert limited.status_code == 200, limited.text
+        assert seen.pop("limit") == 15
+
+        # a limit below 1 would loop a paging client on an unmoving cursor
+        bad_limit = await client.get(
+            "/evals/e1/sample/events", params={"sample_id": "case/001", "limit": 0}
+        )
+        assert bad_limit.status_code == 400
+        assert "limit" in bad_limit.json()["error"]
+
         missing = await client.get(
             "/evals/e1/sample/events", params={"sample_id": "missing"}
         )
         assert missing.status_code == 404
 
 
+async def test_sample_messages_endpoint_round_trips_and_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sample-messages route passes `tail`/`full`, round-trips a reserved id, 404s.
+
+    `GET /evals/<id>/sample/messages`: `sample_id` as a query param (so
+    reserved chars address), `tail`/`full` forwarded, and a missing sample →
+    404. The helper logic is unit-tested in test_messages.py; this pins the
+    route wiring.
+    """
+    from inspect_ai._control import server as server_mod
+
+    seen: dict[str, object] = {}
+
+    async def _fake(
+        eval_id: str,
+        sample_id: str,
+        epoch: int,
+        *,
+        tail: object,
+        full: object,
+    ) -> dict[str, object] | None:
+        seen["sample_id"] = sample_id
+        seen["tail"] = tail
+        seen["full"] = full
+        if sample_id == "missing":
+            return None
+        return {"as_of": 1.0, "status": "running", "count": 0, "messages": []}
+
+    monkeypatch.setattr(server_mod, "sample_messages", _fake)
+
+    app = server_mod.ControlServer(run_id="test")._build_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://localhost"
+    ) as client:
+        ok = await client.get(
+            "/evals/e1/sample/messages",
+            params={"sample_id": "case/001", "tail": 5, "full": "true"},
+        )
+        assert ok.status_code == 200, ok.text
+        assert seen["sample_id"] == "case/001"  # reserved-char id round-trips
+        assert seen["tail"] == 5
+        assert seen["full"] is True
+
+        missing = await client.get(
+            "/evals/e1/sample/messages", params={"sample_id": "missing"}
+        )
+        assert missing.status_code == 404
+
+
+async def test_samples_endpoint_parses_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`GET /evals/<id>/samples` parses `filter` and defaults it off.
+
+    The state-layer filtering is unit-tested; this pins the route wiring —
+    `filter=errors` reaches the state layer as "errors", an omitted param
+    keeps the full listing (None), and an unrecognized filter value is
+    rejected (422) rather than silently answered with the full listing,
+    since the CLI trusts the filter was applied and keeps no fallback.
+    """
+    from inspect_ai._control import server as server_mod
+    from inspect_ai._control.state import SampleListing
+
+    seen: dict[str, object] = {}
+
+    async def _fake(
+        eval_id: str,
+        active_since: float | None = None,
+        statuses: frozenset[str] | None = None,
+        limit: int | None = None,
+        sample_filter: str | None = None,
+    ) -> SampleListing:
+        seen["eval_id"] = eval_id
+        seen["sample_filter"] = sample_filter
+        return SampleListing(counts={}, samples=[], truncated=False)
+
+    monkeypatch.setattr(server_mod, "current_sample_listing", _fake)
+
+    app = server_mod.ControlServer(run_id="test")._build_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://localhost"
+    ) as client:
+        filtered = await client.get("/evals/e1/samples", params={"filter": "errors"})
+        assert filtered.status_code == 200, filtered.text
+        assert seen["sample_filter"] == "errors"
+
+        default = await client.get("/evals/e1/samples")
+        assert default.status_code == 200, default.text
+        assert seen["sample_filter"] is None
+
+        seen.clear()
+        unknown = await client.get("/evals/e1/samples", params={"filter": "bogus"})
+        assert unknown.status_code == 422, unknown.text
+        assert "sample_filter" not in seen  # rejected before the state layer
+
+
+async def test_404_body_shape_distinguishes_missing_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Handler 404s carry ``{"error": ...}``; the router's 404 does not.
+
+    The CLI reads this distinction (`_handler_404`) to report version skew
+    definitively when a route doesn't exist on an older server — see the
+    convention comment in ``_build_app``. A handler 404 that dropped the
+    ``error`` key would misreport an entity-not-found as version skew.
+    """
+    from inspect_ai._cli.ctl import _handler_404
+    from inspect_ai._control import server as server_mod
+
+    monkeypatch.setattr(
+        server_mod,
+        "cancel_task",
+        lambda task_id, action="cancel", dry_run=False: None,
+    )
+
+    app = server_mod.ControlServer(run_id="test")._build_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://localhost"
+    ) as client:
+        handler = await client.post("/tasks/nope/cancel")
+        assert handler.status_code == 404
+        assert _handler_404(handler)
+
+        router = await client.post("/tasks/nope/endpoint-from-the-future")
+        assert router.status_code == 404
+        assert not _handler_404(router)
+
+
 def test_resolve_ctl_server_values() -> None:
     """The ``ctl_server`` param resolves to ``(enabled, keep_alive)``.
 
     ``None`` and ``True`` are the default-on shape, ``False`` disables,
-    ``"keep-alive"`` enables + parks. The CLI string spellings are accepted
+    ``"keep"`` enables + parks. The CLI string spellings are accepted
     case-insensitively so programmatic callers can forward a flag or
     ``INSPECT_EVAL_CTL_SERVER`` env value verbatim. Any other string is
     rejected rather than silently treated as ``True`` — it's more likely a
-    typo of ``keep-alive``, and dropping the requested park would strand the
+    typo of ``keep``, and dropping the requested park would strand the
     user.
     """
     from inspect_ai._control.server import resolve_ctl_server
@@ -362,6 +707,8 @@ def test_resolve_ctl_server_values() -> None:
     assert resolve_ctl_server(None) == (True, False)
     assert resolve_ctl_server(True) == (True, False)
     assert resolve_ctl_server(False) == (False, False)
+    assert resolve_ctl_server("keep") == (True, True)
+    # `keep-alive` is still accepted as a legacy alias for `keep`
     assert resolve_ctl_server("keep-alive") == (True, True)
 
     # CLI / env-var spellings forwarded verbatim
@@ -372,6 +719,7 @@ def test_resolve_ctl_server_values() -> None:
     assert resolve_ctl_server("no") == (False, False)
     assert resolve_ctl_server("0") == (False, False)
     assert resolve_ctl_server("TRUE") == (True, False)
+    assert resolve_ctl_server("KEEP") == (True, True)
     assert resolve_ctl_server("Keep-Alive") == (True, True)
 
     with pytest.raises(PrerequisiteError, match="keepalive"):
@@ -406,57 +754,95 @@ def test_control_server_disabled_binds_nothing(
     asyncio.run(run())
 
 
-def test_release_latches_before_the_park() -> None:
+def test_release_before_park_skips_it() -> None:
     """A release received while the eval is still running means "exit when done".
 
-    The route latches process-wide (not just the per-server event): the
-    standalone park's wait must return immediately, and the eval-set park —
-    which binds a FRESH server after the run's server is gone — must see the
-    latch too. The latch resets at the outermost run boundary so a prior
-    run's release can't leak into the next run's park.
+    The intent is process-wide: the standalone park's wait must return
+    immediately, and the eval-set park — which binds a FRESH server after the
+    run's server is gone — must see it too. The intent resets at the outermost
+    run boundary so a prior run's release can't leak into the next run's park.
     """
     from inspect_ai._control.server import (
         ControlServer,
-        release_requested,
+        keep_alive_intent,
+        request_keep_alive,
         request_release,
-        reset_release_requested,
+        reset_keep_alive,
         wait_for_shutdown_async,
     )
 
-    reset_release_requested()
+    reset_keep_alive()
     try:
-        assert not release_requested()
-
-        # mid-run release latches...
+        # a mid-run release wins the last word over an earlier keep...
+        request_keep_alive()
         request_release()
-        assert release_requested()
+        assert keep_alive_intent() is False
 
         # ...so a later park's wait returns immediately, even on a fresh
-        # server whose own event was never set (the eval-set park shape)
+        # server (the eval-set park shape)
         async def park() -> None:
             await asyncio.wait_for(
                 wait_for_shutdown_async(ControlServer(run_id="fresh")), timeout=5
             )
 
         asyncio.run(park())
-
-        # the next run clears the latch
-        reset_release_requested()
-        assert not release_requested()
     finally:
-        reset_release_requested()
+        reset_keep_alive()
 
 
-async def test_release_route_sets_the_latch() -> None:
-    """POST /release latches process-wide in addition to the server event."""
+def test_keep_after_release_rearms_the_park() -> None:
+    """A keep -> release -> keep while running leaves the process parking.
+
+    The regression: release used to latch irreversibly, so a keep that
+    followed it was ignored. Now the intent is last-write-wins and the park
+    re-checks it, so the final keep re-arms the park — it blocks until a
+    *subsequent* release.
+    """
     from inspect_ai._control.server import (
         ControlServer,
-        release_requested,
-        reset_release_requested,
+        keep_alive_intent,
+        request_keep_alive,
+        request_release,
+        reset_keep_alive,
+        wait_for_shutdown_async,
     )
 
-    reset_release_requested()
+    reset_keep_alive()
     try:
+
+        async def scenario() -> None:
+            server = ControlServer(run_id="test")
+            request_keep_alive()
+            request_release()
+            request_keep_alive()  # last write wins
+            assert keep_alive_intent() is True
+
+            park = asyncio.ensure_future(wait_for_shutdown_async(server))
+            await asyncio.sleep(0.1)
+            assert not park.done()  # still parked, despite the earlier release
+
+            # a fresh release now wakes it
+            request_release()
+            await server.notify_park_change()
+            await asyncio.wait_for(park, timeout=5)
+
+        asyncio.run(scenario())
+    finally:
+        reset_keep_alive()
+
+
+async def test_release_route_clears_the_intent() -> None:
+    """POST /release latches keep-alive off process-wide."""
+    from inspect_ai._control.server import (
+        ControlServer,
+        keep_alive_intent,
+        request_keep_alive,
+        reset_keep_alive,
+    )
+
+    reset_keep_alive()
+    try:
+        request_keep_alive()
         server = ControlServer(run_id="test")
         app = server._build_app()
         transport = httpx.ASGITransport(app=app)
@@ -466,26 +852,324 @@ async def test_release_route_sets_the_latch() -> None:
             response = await client.post("/release")
             assert response.status_code == 200
 
-        assert release_requested()
-        assert server.shutdown_event.is_set()
+        assert keep_alive_intent() is False
     finally:
-        reset_release_requested()
+        reset_keep_alive()
 
 
-def test_eval_set_park_skipped_when_release_latched() -> None:
-    """A latched release makes the eval-set park return without binding.
+def test_eval_set_park_skipped_when_intent_off() -> None:
+    """An off intent makes the eval-set park return without binding.
 
-    The eval-set park binds a fresh server (fresh event), so the latch is
-    the only carrier of a release received during the run. A regression
-    here would bind a real control server and park forever — bounded by
-    the wait_for timeout.
+    The eval-set park binds a fresh server, so the module-level intent is the
+    only carrier of a release received during the run. A regression here would
+    bind a real control server and park forever — bounded by the wait_for
+    timeout.
     """
-    from inspect_ai._control.server import request_release, reset_release_requested
+    from inspect_ai._control.server import request_release, reset_keep_alive
     from inspect_ai._eval.evalset import _keep_alive_park
 
-    reset_release_requested()
+    reset_keep_alive()
     try:
-        request_release()
-        asyncio.run(asyncio.wait_for(_keep_alive_park("set-1"), timeout=5))
+        request_release()  # intent off
+        asyncio.run(asyncio.wait_for(_keep_alive_park("set-1", "/logs"), timeout=5))
     finally:
-        reset_release_requested()
+        reset_keep_alive()
+
+
+def test_keep_alive_intent_last_write_wins() -> None:
+    """Keep / release toggle a single intent; the last call wins."""
+    from inspect_ai._control.server import (
+        keep_alive_intent,
+        request_keep_alive,
+        request_release,
+        reset_keep_alive,
+    )
+
+    reset_keep_alive()
+    try:
+        assert keep_alive_intent() is False  # default
+        request_keep_alive()
+        assert keep_alive_intent() is True
+        request_release()
+        assert keep_alive_intent() is False
+        request_keep_alive()
+        assert keep_alive_intent() is True  # a later keep overrides the release
+    finally:
+        reset_keep_alive()
+
+
+async def test_keep_route_sets_the_intent() -> None:
+    """POST /keep latches keep-alive on process-wide."""
+    from inspect_ai._control.server import (
+        ControlServer,
+        keep_alive_intent,
+        reset_keep_alive,
+    )
+
+    reset_keep_alive()
+    try:
+        server = ControlServer(run_id="test")
+        app = server._build_app()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://localhost"
+        ) as client:
+            response = await client.post("/keep")
+            assert response.status_code == 200
+
+        assert keep_alive_intent() is True
+    finally:
+        reset_keep_alive()
+
+
+async def test_tasks_endpoint_decorates_keep_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /tasks stamps each task summary with the live keep-alive status."""
+    from inspect_ai._control import server as server_mod
+    from inspect_ai._control.server import (
+        ControlServer,
+        request_keep_alive,
+        reset_keep_alive,
+    )
+
+    async def _two_rows(started_at: float) -> list[dict]:
+        return [{"task_id": "a"}, {"task_id": "b"}]
+
+    monkeypatch.setattr(server_mod, "current_eval_summaries", _two_rows)
+
+    reset_keep_alive()
+    try:
+
+        async def _get() -> list[dict]:
+            app = ControlServer(run_id="test")._build_app()
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://localhost"
+            ) as client:
+                return (await client.get("/tasks")).json()
+
+        # off by default
+        rows = await _get()
+        assert [r["keep_alive"] for r in rows] == [False, False]
+
+        # flips on for every row once keep-alive is latched
+        request_keep_alive()
+        rows = await _get()
+        assert [r["keep_alive"] for r in rows] == [True, True]
+    finally:
+        reset_keep_alive()
+
+
+def test_keep_alive_intent_resets() -> None:
+    """The keep-alive intent clears at the outermost run boundary."""
+    from inspect_ai._control.server import (
+        keep_alive_intent,
+        request_keep_alive,
+        reset_keep_alive,
+    )
+
+    reset_keep_alive()
+    try:
+        assert not keep_alive_intent()
+        request_keep_alive()
+        assert keep_alive_intent()
+        reset_keep_alive()
+        assert not keep_alive_intent()
+    finally:
+        reset_keep_alive()
+
+
+async def test_tasks_rows_advertise_api_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every `/tasks` row is stamped with the server's control-API version.
+
+    The version rides the row (like `keep_alive`) so HTTP consumers can gate
+    version-dependent requests without an extra round trip; the discovery
+    file carries the same value for the window before any task registers.
+    """
+    from inspect_ai._control import CONTROL_API_VERSION
+    from inspect_ai._control import server as server_mod
+    from inspect_ai._control.server import ControlServer
+
+    async def _two_rows(started_at: float) -> list[dict]:
+        return [{"task_id": "a"}, {"task_id": "b"}]
+
+    monkeypatch.setattr(server_mod, "current_eval_summaries", _two_rows)
+
+    app = ControlServer(run_id="test")._build_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://localhost"
+    ) as client:
+        rows = (await client.get("/tasks")).json()
+    assert [r["api_version"] for r in rows] == [CONTROL_API_VERSION] * 2
+
+
+def test_start_advertises_api_version_in_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The discovery file published by `start()` carries CONTROL_API_VERSION.
+
+    The CLI gates version-dependent config knobs on the discovery file's
+    `api_version` before sending a mutation, so it must be published at bind
+    time — including the window before any task registers, when `/tasks` is
+    still empty.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import inspect_ai._control.discovery as discovery
+    from inspect_ai._control import CONTROL_API_VERSION
+    from inspect_ai._control.discovery import list_discovered_servers
+    from inspect_ai._control.server import ControlServer
+
+    # short dir under /tmp: macOS pytest tmp_path blows past the AF_UNIX
+    # 104-char socket-path limit (cf. the short_data_dir fixture in
+    # test_eval_set_integration.py)
+    dirpath = Path(tempfile.mkdtemp(prefix="ctl_ver_", dir="/tmp"))
+
+    def _stub_data_dir(subdir: str | None = None) -> Path:
+        path = (dirpath / (subdir or "")).resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    monkeypatch.setattr(discovery, "inspect_data_dir", _stub_data_dir)
+
+    async def run() -> None:
+        server = ControlServer(run_id="run-1")
+        await server.start()
+        try:
+            assert [s.api_version for s in list_discovered_servers()] == [
+                CONTROL_API_VERSION
+            ]
+        finally:
+            await server.stop()
+
+    try:
+        asyncio.run(run())
+    finally:
+        shutil.rmtree(dirpath, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Peer credential (SO_PEERCRED / LOCAL_PEERCRED) check
+# ---------------------------------------------------------------------------
+
+
+def test_peer_uid_reports_own_uid_over_socketpair() -> None:
+    """``peer_uid`` reads this process's euid off an AF_UNIX socketpair."""
+    import os
+    import socket
+
+    from inspect_ai._util.sockets import peer_uid
+
+    if not hasattr(socket, "AF_UNIX"):
+        pytest.skip("AF_UNIX not available on this platform")
+
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        assert peer_uid(a) == os.geteuid()
+        assert peer_uid(b) == os.geteuid()
+    finally:
+        a.close()
+        b.close()
+
+
+def test_peer_uid_unpacks_high_uids_unsigned() -> None:
+    """``uid_t`` is unsigned: peer uids >= 2**31 must not unpack negative.
+
+    Regression: unpacking Linux ``struct ucred`` with a signed format mapped
+    nfsnobody-style uids (4294967294) to -2, so the same-user comparison
+    failed and the server dropped that user's own connection.
+    """
+    import socket
+    import struct
+    import sys
+    from typing import cast
+
+    from inspect_ai._util.sockets import peer_uid
+
+    if sys.platform != "linux":
+        pytest.skip("SO_PEERCRED struct ucred layout is Linux-specific")
+
+    high_uid = 4294967294  # nfsnobody on older RHEL
+
+    class FakeSocket:
+        family = socket.AF_UNIX
+
+        def getsockopt(self, level: int, optname: int, buflen: int = 0) -> bytes:
+            assert level == socket.SOL_SOCKET and optname == socket.SO_PEERCRED
+            return struct.pack("iII", 1234, high_uid, high_uid)
+
+    assert peer_uid(cast(socket.socket, FakeSocket())) == high_uid
+
+
+def test_control_server_rejects_mismatched_peer_uid(
+    monkeypatch: pytest.MonkeyPatch, short_data_dir
+) -> None:
+    """A connection whose peer UID differs from the server's is dropped.
+
+    The SO_PEERCRED / LOCAL_PEERCRED hardening: the connection must die at
+    the transport layer (no HTTP response at all), not merely 4xx — a
+    foreign-UID peer gets no protocol surface whatsoever. Forcing a real
+    mismatch needs a second user, so the credential reader is stubbed; the
+    genuine same-UID path is covered end-to-end by the acceptance test
+    below.
+    """
+    import os
+
+    import inspect_ai._control.server as server_mod
+    from inspect_ai._control.server import control_server
+
+    monkeypatch.setattr(server_mod, "peer_uid", lambda sock: os.geteuid() + 1)
+
+    async def run() -> None:
+        async with control_server(run_id="run-peercred-reject") as srv:
+            assert srv is not None and srv.socket_path is not None
+            transport = httpx.AsyncHTTPTransport(uds=str(srv.socket_path))
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://control"
+            ) as client:
+                with pytest.raises(httpx.TransportError):
+                    await client.get("/tasks")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "stub_uid",
+    [None, "own"],
+    ids=["credential-unavailable-fails-open", "same-uid"],
+)
+def test_control_server_accepts_peer(
+    monkeypatch: pytest.MonkeyPatch, short_data_dir, stub_uid
+) -> None:
+    """Same-UID peers are served; an unreadable credential fails open.
+
+    ``same-uid`` runs the real credential read end-to-end over the bound
+    socket. ``credential-unavailable`` stubs ``peer_uid`` to ``None``
+    (platform without the API / failed getsockopt) and must still serve —
+    the check is defence-in-depth on top of the filesystem permissions, so
+    an indeterminate credential allows rather than bricking the surface.
+    """
+    from inspect_ai._control.server import control_server
+
+    if stub_uid is None:
+        import inspect_ai._control.server as server_mod
+
+        monkeypatch.setattr(server_mod, "peer_uid", lambda sock: None)
+
+    async def run() -> None:
+        async with control_server(run_id="run-peercred-accept") as srv:
+            assert srv is not None and srv.socket_path is not None
+            transport = httpx.AsyncHTTPTransport(uds=str(srv.socket_path))
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://control"
+            ) as client:
+                response = await client.get("/tasks")
+            assert response.status_code == 200
+
+    asyncio.run(run())

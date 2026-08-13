@@ -11,7 +11,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from inspect_ai.model import RetryDecision
+from inspect_ai.model import RetryDecision, get_model
 
 
 def _http_response(
@@ -24,6 +24,57 @@ def _http_response(
         headers=headers or {},
         request=request,
     )
+
+
+# ---------- Model-level generic classification ----------
+
+
+def test_model_anyio_transport_close_race_classifies_as_retryable() -> None:
+    """The anyio asyncio-backend transport-close race is retried for any provider.
+
+    anyio's SocketStream.aclose() can call transport.abort() after
+    connection_lost already ran (nulling transport._loop), raising
+    AttributeError("'NoneType' object has no attribute 'call_soon'") out of
+    httpx response close — after the request completed successfully.
+    """
+    model = get_model("mockllm/model")
+    ex = AttributeError("'NoneType' object has no attribute 'call_soon'")
+    assert model.should_retry(ex) is True
+
+
+def test_model_transport_close_race_matches_structured_fields() -> None:
+    """Reworded message still retries via AttributeError.name/.obj.
+
+    Interpreter-raised AttributeError carries name/obj since 3.10; the
+    classifier ORs (name == "call_soon" and obj is None) with the message
+    match so a CPython message rewording doesn't silently drop the retry.
+    """
+    model = get_model("mockllm/model")
+    ex = AttributeError("some future rewording", name="call_soon", obj=None)
+    assert model.should_retry(ex) is True
+
+
+def test_model_unrelated_attribute_error_does_not_retry() -> None:
+    model = get_model("mockllm/model")
+    ex = AttributeError("'NoneType' object has no attribute 'read'")
+    assert model.should_retry(ex) is False
+
+
+def test_model_call_soon_on_non_none_object_does_not_retry() -> None:
+    """A deterministic bug mentioning call_soon (wrong-typed receiver) must not retry.
+
+    The race always nulls transport._loop, so its message names NoneType;
+    anything else is a real bug that should fail fast rather than retry forever.
+    """
+    model = get_model("mockllm/model")
+    ex = AttributeError("'Foo' object has no attribute 'call_soon'")
+    assert model.should_retry(ex) is False
+
+    # structured fields on a non-None receiver must not match either
+    ex2 = AttributeError(
+        "'Foo' object has no attribute 'call_soon'", name="call_soon", obj=object()
+    )
+    assert model.should_retry(ex2) is False
 
 
 # ---------- Default ModelAPI base ----------
@@ -435,6 +486,68 @@ def test_google_503_unavailable_classifies_as_transient() -> None:
     decision = api.should_retry(ex)
     assert isinstance(decision, RetryDecision)
     assert decision.kind == "transient"
+
+
+def test_google_client_payload_transfer_encoding_classifies_as_transient() -> None:
+    """A chunked response truncated mid-body (connection reset) is transient."""
+    import aiohttp
+
+    from inspect_ai.model._providers.google import GoogleGenAIAPI
+
+    api = GoogleGenAIAPI.__new__(GoogleGenAIAPI)
+    ex = aiohttp.ClientPayloadError("Response payload is not completed")
+    ex.__cause__ = aiohttp.http_exceptions.TransferEncodingError(
+        message="Not enough data to satisfy transfer length header."
+    )
+    decision = api.should_retry(ex)
+    assert isinstance(decision, RetryDecision)
+    assert decision.retry is True
+    assert decision.kind == "transient"
+
+
+def test_google_client_payload_content_length_classifies_as_transient() -> None:
+    """A Content-Length response truncated the same way is equally transient."""
+    import aiohttp
+
+    from inspect_ai.model._providers.google import GoogleGenAIAPI
+
+    api = GoogleGenAIAPI.__new__(GoogleGenAIAPI)
+    ex = aiohttp.ClientPayloadError("Response payload is not completed")
+    ex.__cause__ = aiohttp.http_exceptions.ContentLengthError(
+        message="Not enough data to satisfy content length header."
+    )
+    decision = api.should_retry(ex)
+    assert isinstance(decision, RetryDecision)
+    assert decision.retry is True
+    assert decision.kind == "transient"
+
+
+def test_google_client_payload_non_encoding_cause_does_not_retry() -> None:
+    """A non-truncation cause (e.g. corrupt compression) is not retryable."""
+    import aiohttp
+
+    from inspect_ai.model._providers.google import GoogleGenAIAPI
+
+    api = GoogleGenAIAPI.__new__(GoogleGenAIAPI)
+    ex = aiohttp.ClientPayloadError("Response payload is not completed")
+    ex.__cause__ = ValueError(
+        "Error -3 while decompressing data: incorrect header check"
+    )
+    decision = api.should_retry(ex)
+    assert isinstance(decision, RetryDecision)
+    assert decision.retry is False
+
+
+def test_google_client_payload_without_cause_does_not_retry() -> None:
+    import aiohttp
+
+    from inspect_ai.model._providers.google import GoogleGenAIAPI
+
+    api = GoogleGenAIAPI.__new__(GoogleGenAIAPI)
+    ex = aiohttp.ClientPayloadError("Response payload is not completed")
+    decision = api.should_retry(ex)
+    assert isinstance(decision, RetryDecision)
+    assert decision.retry is False
 
 
 # ---------- Grok (gRPC) ----------
